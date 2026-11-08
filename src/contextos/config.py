@@ -161,6 +161,9 @@ class Experiment:
     train_tasks: int | None = None  # None = every training task
     evaluation_repeats: int = 2
     evaluation_tasks: int | None = None  # fixed validation prefix for time-limited screening; test stays complete
+    exclude_tasks: list[str] = field(
+        default_factory=list
+    )  # task IDs removed from their partitions after the seeded split
     workers: int = 1  # concurrent episodes; 1 reproduces a sequential run exactly
     episode_retries: int = 1  # re-run a failed episode this many times before skipping it
     max_consecutive_failures: int = 3  # abort the run after this many skipped episodes in a row

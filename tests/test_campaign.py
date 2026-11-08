@@ -4,6 +4,7 @@ import fcntl
 import gzip
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from contextos.config import load_config
+from contextos.experiments import build_schedule
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "cluster" / "campaign.sbatch"
@@ -59,6 +61,155 @@ def shell_function(name):
     source = SCRIPT.read_text()
     # Load only the requested function, never the script's Slurm/server setup.
     return name + "() {" + source.split(name + "() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+
+@pytest.fixture
+def exclusion_profile(tmp_path):
+    rows = tmp_path / "rows.jsonl"
+    rows.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "instance_id": f"fixture__repo-{i}",
+                    "repo": "fixture/repo",
+                    "base_commit": "a" * 40,
+                    "problem_statement": "Fix it.",
+                }
+            )
+            + "\n"
+            for i in range(230)
+        )
+    )
+    config = {
+        "benchmark": {"rows": str(rows), "counts": {"train": 170, "validation": 30, "test": 30}},
+        "experiment": {"train_tasks": 170, "attempts_per_task": 1, "evaluation_repeats": 2},
+    }
+    path = tmp_path / "profile.yaml"
+    path.write_text(json.dumps(config))
+    cfg = load_config([path])
+    original = build_schedule(cfg, True, "train")
+    excluded = []
+    for partition, count in (("train", 9), ("validation", 1), ("test", 3)):
+        schedule = build_schedule(cfg, partition == "train", partition)
+        excluded.extend([row["instance_id"] for row, repeat in schedule if repeat == 0][:count])
+    config["experiment"]["exclude_tasks"] = excluded
+    path.write_text(json.dumps(config))
+    python = tmp_path / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(f'#!/bin/bash\nexec {shlex.quote(sys.executable)} "$@"\n')
+    python.chmod(0o700)
+    return path, excluded, original
+
+
+def expected_size(tmp_path, config, directory, training="1", partition="train", cap=170):
+    script = (
+        'set -uo pipefail\nexport PYTHONPATH="$1/src"\nCONFIG_ARGS=(-c "$2"); COMMON_SETS=()\n'
+        "TRAIN=$4; PARTITION=$5; MAX_EPISODES=$6\n" + shell_function("expected_episodes") + 'expected_episodes "$3"\n'
+    )
+    return subprocess.run(
+        ["bash", "-c", script, "test", str(ROOT), str(config), str(directory), training, partition, str(cap)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("existing", "partition", "expected"),
+    [(False, "train", 161), (True, "train", 161), (True, "validation", 58), (True, "test", 54)],
+)
+def test_campaign_exclusion_guard_allows_fresh_and_matching_runs(
+    tmp_path, exclusion_profile, existing, partition, expected
+):
+    config, excluded, _ = exclusion_profile
+    directory = tmp_path / "run"
+    if existing:
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps({"experiment": {"exclude_tasks": excluded[::-1]}}))
+        progress(directory)
+    result = expected_size(
+        tmp_path,
+        config,
+        directory,
+        training="1" if partition == "train" else "0",
+        partition=partition,
+        cap=170 if partition == "train" else 60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(expected)
+    assert directory.exists() is existing  # schedule sizing must not create or rewrite a run
+
+
+def test_campaign_exclusion_guard_allows_legacy_run_without_exclusions(tmp_path, exclusion_profile):
+    config, _, _ = exclusion_profile
+    settings = json.loads(config.read_text())
+    del settings["experiment"]["exclude_tasks"]
+    config.write_text(json.dumps(settings))
+    directory = tmp_path / "run"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps({"experiment": {}}))
+    progress(directory)
+    result = expected_size(tmp_path, config, directory)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "170"
+
+
+@pytest.mark.parametrize("recorded", [None, "{broken json"])
+def test_campaign_exclusion_guard_rejects_unverifiable_existing_run(tmp_path, exclusion_profile, recorded):
+    config, _, _ = exclusion_profile
+    directory = tmp_path / "run"
+    directory.mkdir()
+    progress(directory)
+    if recorded is not None:
+        (directory / "config.json").write_text(recorded)
+    result = expected_size(tmp_path, config, directory)
+    assert result.returncode != 0
+    assert "Cannot verify task exclusions" in result.stderr and "choose a new run directory" in result.stderr
+
+
+def test_campaign_rejects_completed_old_schedule_before_completion_or_server(
+    tmp_path, exclusion_profile, campaign_modules
+):
+    config, _, original = exclusion_profile
+    state, _ = campaign_modules
+    directory = tmp_path / "run-ppo-on-h200"
+    directory.mkdir()
+    names = [
+        published(directory, index, f"{row['instance_id']}-{repeat}-ppo")
+        for index, (row, repeat) in enumerate(original)
+    ]
+    progress(directory, schedule_length=170, cursor=170, consumed_names=names, learned_names=names)
+    (directory / "policy.pt").touch()
+    (directory / "config.json").write_text(json.dumps({"experiment": {}}))  # the pre-exclusion schema
+    assert state.complete(directory, 161, training=True)  # the previous shortcut accepted this stale run
+    before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+    source = SCRIPT.read_text()
+    loop = "CAMPAIGN_FAILED=0" + source.split("CAMPAIGN_FAILED=0", 1)[1]
+    marker = tmp_path / "unexpected-completion-or-server"
+    script = (
+        'set -uo pipefail\nexport PYTHONPATH="$1/src"\nRUN=$2; CONFIG_ARGS=(-c "$3"); AUDIT_MARKER=$4\n'
+        'log() { printf "%s\\n" "$*"; }\n'
+        'run_complete() { echo completion >> "$AUDIT_MARKER"; return 0; }\n'
+        'ensure_server() { echo server >> "$AUDIT_MARKER"; return 1; }\n'
+        "done_episodes() { echo 170; }\n"
+        "TRAIN=1; COMMAND=train; PARTITIONS=train; STRATEGY=ppo; MODES=on; PHASES=200; "
+        "MAX_EPISODES=170; TRIES=1; REPEATS=1; MAX_EPISODE_SECONDS=3600; "
+        "SERVED=qwen3.6-35b-a3b; TASKS=170\n"
+        + shell_function("expected_episodes")
+        + shell_function("common_sets")
+        + loop
+    )
+    result = subprocess.run(
+        ["bash", "-c", script, "test", str(ROOT), str(tmp_path / "run"), str(config), str(marker)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "task exclusions differ" in result.stderr and "choose a new run directory" in result.stderr
+    assert not marker.exists()
+    assert not Path(str(directory) + ".prefetch.log").exists()
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == before
 
 
 @pytest.mark.parametrize("training", ["0", "1"])
@@ -235,6 +386,7 @@ def test_campaign_restart_does_not_skip_published_unconsumed_training(tmp_path):
         'log() { printf "%s\\n" "$*"; }\n'
         'ensure_server() { printf "needed\\n" > "$AUDIT_MARKER"; return 1; }\n'
         'done_episodes() { ls "$1"/episodes/*.json.gz 2>/dev/null | wc -l | tr -d " "; }\n'
+        'expected_episodes() { echo "$MAX_EPISODES"; }\n'
         "TRAIN=1; COMMAND=train; PARTITIONS=train; STRATEGY=ppo; MODES=off; PHASES=200; "
         "MAX_EPISODES=2; TRIES=1; REPEATS=1; MAX_EPISODE_SECONDS=3600; "
         "SERVED=qwen3.6-35b-a3b; TASKS=; CONFIG_ARGS=()\n"

@@ -66,8 +66,15 @@ def run(
 
 
 def build_schedule(cfg: Config, training: bool, partition: str) -> list[tuple[dict, int]]:
-    """(row, repeat) pairs in run order: every task of the partition times its attempts."""
-    rows = split(cfg, load_rows(cfg))[partition]
+    """(row, repeat) pairs in run order: every task of the partition times its attempts. Excluded tasks leave
+    their partition after the seeded split, so the other partitions keep their membership; prefixes
+    (`train_tasks`, `evaluation_tasks`) then count eligible tasks only."""
+    partitions = split(cfg, load_rows(cfg))
+    excluded = set(cfg.experiment.exclude_tasks or [])
+    unknown = excluded - {row["instance_id"] for rows in partitions.values() for row in rows}
+    if unknown:
+        raise ValueError(f"experiment.exclude_tasks names unknown tasks: {sorted(unknown)[:5]}")
+    rows = [row for row in partitions[partition] if row["instance_id"] not in excluded]
     if not training and partition == "validation" and cfg.experiment.evaluation_tasks is not None:
         count = cfg.experiment.evaluation_tasks
         if type(count) is not int or count <= 0 or count > len(rows):

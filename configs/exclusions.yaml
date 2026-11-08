@@ -1,0 +1,33 @@
+# Task exclusions for the 2026-11-09 campaign: flagged tasks whose reference-patch check (contextos_next_round
+# regrade_saved.py --reference) did not pass, so their grading environment is not validated. Applied after the seeded
+# split, so every other task keeps its partition. Each task is excluded pending an environment investigation.
+#
+# task                              split       verdict          reason / log
+# Project-MONAI__MONAI-1121         train       resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-train/verifier/Project-MONAI__MONAI-1121
+# Project-MONAI__MONAI-6975         validation  error            reference grading did not complete: RuntimeError: Grading capture was interrupted, truncated, or incomplete; inspect execution.json; log: runs/preflight-validation/verifier/Project-MONAI__MONAI-6975
+# iterative__dvc-2017               test        resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-test/verifier/iterative__dvc-2017
+# modin-project__modin-5940         train       error            reference grading did not complete: RuntimeError: Grading capture was interrupted, truncated, or incomplete; inspect execution.json; log: runs/preflight-train-incomplete/verifier/modin-project__modin-5940
+# modin-project__modin-6298         train       resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-train/verifier/modin-project__modin-6298
+# modin-project__modin-6400         train       resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-train/verifier/modin-project__modin-6400
+# modin-project__modin-6780         test        resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-test/verifier/modin-project__modin-6780
+# modin-project__modin-6937         train       error            reference grading did not complete: RuntimeError: Grading capture was interrupted, truncated, or incomplete; inspect execution.json; log: runs/preflight-train-incomplete/verifier/modin-project__modin-6937
+# pandas-dev__pandas-48106          train       resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-train/verifier/pandas-dev__pandas-48106
+# pandas-dev__pandas-50319          test        resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-test/verifier/pandas-dev__pandas-50319
+# pandas-dev__pandas-51605          train       resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-train/verifier/pandas-dev__pandas-51605
+# pandas-dev__pandas-53958          train       resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-train/verifier/pandas-dev__pandas-53958
+# pandas-dev__pandas-56849          train       resolved=False   the benchmark's reference patch fails its own tests in this environment; log: runs/preflight-train/verifier/pandas-dev__pandas-56849
+experiment:
+  exclude_tasks:
+    - Project-MONAI__MONAI-1121
+    - Project-MONAI__MONAI-6975
+    - iterative__dvc-2017
+    - modin-project__modin-5940
+    - modin-project__modin-6298
+    - modin-project__modin-6400
+    - modin-project__modin-6780
+    - modin-project__modin-6937
+    - pandas-dev__pandas-48106
+    - pandas-dev__pandas-50319
+    - pandas-dev__pandas-51605
+    - pandas-dev__pandas-53958
+    - pandas-dev__pandas-56849
