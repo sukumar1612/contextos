@@ -1,0 +1,37 @@
+.venv/
+__pycache__/
+*.pyc
+runs/
+data/*
+.cache/
+.idea/
+*.egg-info/
+.env
+.env.*
+!data/swe_gym_lite.jsonl
+parallel_runs/results/
+parallel_runs/state/
+parallel_runs/endpoints.yaml
+external/
+
+# editor, OS and tool caches
+.DS_Store
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+# patch leftovers and stray logs (campaign logs live under runs/)
+*.orig
+*.rej
+*.log
+# reviewer reproduction output
+contextos_next_round/recomputed/
+
+# generated results and evidence: source, configs, docs, tests and the dataset are versioned, outputs are not
+cluster/vllm/benchmarks/
+contextos_next_round/results/
+contextos_next_round/figures/
+
+# local-only tooling: cluster launch scripts, review audits and the reviewer's experiment package
+cluster/
+audit/
+contextos_next_round/

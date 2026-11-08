@@ -1,0 +1,38 @@
+# Runs on the SoC cluster against the Qwen3.6-35B-A3B vLLM server (cluster/vllm/servethink.sbatch).
+# cluster/campaign.sbatch fills in the live server address, the tokenizer directory, horizon, repeats and the
+# thinking switch with --set; everything else that matters for comparability is pinned here.
+strategy:
+  name: smoothagent_lookahead
+provider:
+  model: qwen3.6-35b-a3b                 # served model name
+  api_key_env: LOCAL_QWEN_API_KEY        # the job scripts export it from ~/vllm/api_key
+  api_key_file: ~/vllm/api_key
+  reasoning_effort: null                 # Qwen3.6 has no effort levels; thinking is switched with chat_template_kwargs
+  chat_template_kwargs: null             # {"enable_thinking": false} for the non-thinking mode
+  output_tokens: 16384                   # thinking shares max_tokens with the reply
+  timeout_seconds: 900
+  max_concurrent_requests: 64            # coding plus background summaries of up to ~24 workers
+  endpoint_file: null                    # the campaign driver points this at a file it keeps current across server restarts
+  server_wait_seconds: 7200              # a request stalls through a server restart instead of failing the episode
+context:
+  summary_output_tokens: 12288
+encoder:
+  semantic: true
+  model: Qwen/Qwen3-Embedding-0.6B
+  revision: 97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3
+  dimension: 256                        # two text blocks + 12 scalars = 524 controller inputs
+  max_tokens: 2048                      # input tokens per block, independent of vector dimension
+  device: cpu                           # harness host; set cuda only when it has a local GPU
+  cache_size: 1024
+experiment:
+  evaluation_repeats: 4
+  max_interactions: 200
+  workers: 12
+  max_episode_seconds: 3600              # wall-clock cap on the agent loop (TIME_LIMIT, still graded)
+sandbox:
+  kind: udocker
+  udocker_mode: F3
+  tool_timeout: 120
+  grader_timeout: 1800
+  template_containers: true              # extract each image once per node, clone per episode and per grade
+  evict_images: false                    # pulled layers live in a cache under $HOME (see cluster/README.md); keep them
