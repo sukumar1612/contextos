@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 import random
@@ -173,6 +174,46 @@ class Controller:
         self.version = self.choice_points = self.steps = self.inserted = 0
         self.checkpoint_metadata: dict = {}
         self.lock = threading.RLock()  # episodes decide on worker threads while the main thread updates
+        self.choice_clock: Path | None = None
+        self.choice_clock_identity: str | None = None
+
+    def bind_choice_clock(self, path: Path, identity: str | None, minimum: int = 0) -> None:
+        """Persist every collected choice independently of learner checkpoint publication.
+
+        The clock includes failed/ungraded attempts, just as the original live counter did.
+        A legacy run can only be recovered to the maximum known lower bound.
+        """
+        with self.lock:
+            if path.exists():
+                record = json.loads(path.read_text())
+                if record.get("schema") != 1 or record.get("identity") != identity:
+                    raise ValueError("Choice clock belongs to another run")
+                count = record.get("choice_points")
+                if type(count) is not int or count < 0:
+                    raise ValueError("Invalid persisted choice clock")
+                minimum = max(minimum, count)
+            self.choice_clock, self.choice_clock_identity = path, identity
+            self.choice_points = max(self.choice_points, minimum)
+            self._persist_choice_clock(self.choice_points)
+
+    def _persist_choice_clock(self, count: int) -> None:
+        if self.choice_clock is None:
+            return
+        temporary = self.choice_clock.with_name(self.choice_clock.name + ".tmp")
+        try:
+            with temporary.open("w") as stream:
+                json.dump({"schema": 1, "identity": self.choice_clock_identity, "choice_points": count}, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.choice_clock)
+            descriptor = os.open(self.choice_clock.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            exc.contextos_persistence_error = True  # type: ignore[attr-defined]
+            raise
 
     def decide(self, observation, mask, training=True) -> Decision:
         with self.lock:
@@ -196,6 +237,7 @@ class Controller:
                 action = int(dist.sample()) if training else int(logits.argmax())
                 log_prob = float(dist.log_prob(torch.tensor([action], device=self.device)))
         if training and sum(mask) > 1:
+            self._persist_choice_clock(self.choice_points + 1)
             self.choice_points += 1
         return Decision(Action(action), log_prob, float(value[0]) if value is not None else 0.0, self.version)
 

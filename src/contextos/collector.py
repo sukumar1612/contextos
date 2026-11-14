@@ -5,8 +5,8 @@ and learn as episodes land ("free"); PPO either runs fork-join cohorts of episod
 under one policy version ("batch") or, with learner.async_collection, keeps every slot busy and learns
 from completed episodes as its episode/choice target is reached ("async"). progress.json holds the launch
 cursor, the indices of episodes in flight, the names of finalized episodes not yet consumed, updates and
-failures. Resume reconciles published episodes with the checkpoint's consumption ledger, then re-runs
-unfinished in-flight work and continues.
+failures. Resume reconciles published episodes with the checkpoint's consumption ledger. Unfinished
+in-flight work reuses a matching saved candidate when available; otherwise it reruns the agent.
 A failed episode is retried, then skipped; several failures in a row abort the run.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import gzip
+import hashlib
 import json
 import logging
 import os
@@ -134,16 +135,30 @@ def attempt(
     def grader(patch: str):
         return grade(cfg, row, patch, directory / "verifier" / name)
 
+    # Reuse the same setting exclusions as normal run resumption: endpoint/node/worker
+    # handovers are permitted, while reward, task, prompt and evaluator changes are not.
+    from contextos.experiments import fingerprint
+
+    candidate_path = directory / "candidates" / f"{name}.json.gz"
+    candidate_identity = {
+        "name": name,
+        "config": fingerprint(cfg, [(row, 0)]),
+        "task": hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest(),
+    }
+
     error: str | None = None
     failed_attempts: list[dict] = []
     for index in range(cfg.experiment.episode_retries + 1):
         try:
             episode = run_episode(
-                cfg, public_task(row, cfg), provider, counter, encoder, strategy, grader, training, name
+                cfg, public_task(row, cfg), provider, counter, encoder, strategy, grader, training, name,
+                candidate_path=candidate_path, candidate_identity=candidate_identity,
             )
             episode["retry_attempts"] = failed_attempts
             return episode, None
         except Exception as exc:  # one bad episode must not end a long run
+            if getattr(exc, "contextos_persistence_error", False):
+                raise
             error = f"{type(exc).__name__}: {exc}"[:500]
             failed_attempts.append(
                 {
@@ -198,6 +213,28 @@ class Collector:
         self.stop: BaseException | None = None  # set to stop launching; raised once everything has drained
         self.executor: ThreadPoolExecutor | None = None
         self.deadline, self.time_limit_reached = deadline, False
+        if self.learning:
+            clock = directory / "choice_clock.json"
+            # Old runs lack a journal. Durable episodes/candidates provide a lower bound,
+            # not an exact reconstruction of choices from interrupted, unpublished work.
+            minimum = 0
+            if not clock.exists():
+                for index in range(len(schedule)):
+                    name = self.name(index)
+                    published = directory / "episodes" / f"{name}.json.gz"
+                    candidate = directory / "candidates" / f"{name}.json.gz"
+                    if published.exists() or candidate.exists():
+                        with gzip.open(published if published.exists() else candidate, "rt") as stream:
+                            item = json.load(stream)
+                        episode = item if published.exists() else item["episode"]
+                        minimum += episode.get("choice_points", sum(
+                            sum(t["mask"]) > 1 for t in episode.get("transitions", [])
+                        ))
+                minimum += sum(
+                    (entry.get("resources") or {}).get("choice_points", 0)
+                    for entry in [*progress.get("retry_attempts", []), *progress.get("failed", [])]
+                )
+            strategy.bind_choice_clock(clock, progress.get("fingerprint"), minimum)
 
     # ---- naming ------------------------------------------------------------------------------------
     def name(self, index: int) -> str:
@@ -268,9 +305,19 @@ class Collector:
             episode["name"], episode["repeat"], episode["schedule_index"] = name, repeat, index
             path = self.directory / "episodes" / f"{name}.json.gz"
             temporary = path.with_name(path.name + ".tmp")
-            with gzip.open(temporary, "wt") as stream:
-                json.dump(episode, stream)
+            with temporary.open("wb") as stream:
+                stream.write(gzip.compress(json.dumps(episode).encode("utf-8")))
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temporary, path)
+            descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            # The published episode now owns the durable evidence. Keep unresolved
+            # candidates, but avoid storing two copies of every successful verifier run.
+            (self.directory / "candidates" / f"{name}.json.gz").unlink(missing_ok=True)
             if self.learning:
                 self.pending.append(episode)
         self.remaining[row["instance_id"]] -= 1

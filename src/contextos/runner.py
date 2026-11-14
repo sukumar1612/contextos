@@ -1,10 +1,14 @@
-"""One repair attempt, start to finish, in memory."""
+"""One repair attempt, preserving the settled candidate before fallible verification."""
 
 from __future__ import annotations
 
+import gzip
+import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from contextos.agent import SYSTEM, TOOLS, error_messages, parse_actions
@@ -27,7 +31,14 @@ def run_episode(
     grade: Callable[[str], Grade],
     training: bool,
     name: str,
+    *,
+    candidate_path: Path | None = None,
+    candidate_identity: dict | None = None,
 ) -> dict:
+    if candidate_path is not None and candidate_identity is None:
+        raise ValueError("A persisted candidate requires an explicit identity")
+    if candidate_path is not None and candidate_path.exists():
+        return grade_candidate(cfg, candidate_path, candidate_identity, grade)
     started, started_at = time.perf_counter(), time.time()
     agent_started = None
     timing = {
@@ -142,12 +153,24 @@ def run_episode(
                 timing["background_settle_seconds"] = time.perf_counter() - settling
                 timing["summary_wait_seconds"] = runtime.summary_wait_seconds
                 env.close()
+        if candidate_path is not None:
+            # Persist the settled agent work before invoking a fallible external verifier.
+            # This file is not a training episode: its outcome and rewards remain unknown.
+            candidate = snapshot(task, transitions, costs, runtime, termination, patch)
+            timing["episode_seconds"] = time.perf_counter() - started
+            candidate.update(timing=timing, started_at=started_at, ended_at=time.time())
+            write_candidate(candidate_path, {
+                "schema": 1, "identity": candidate_identity, "state": "awaiting_grade", "episode": candidate,
+            })
+            return grade_candidate(cfg, candidate_path, candidate_identity, grade)
         grading = time.perf_counter()
         try:
             verdict = grade(patch)
         finally:
             timing["grading_seconds"] = time.perf_counter() - grading
     except BaseException as exc:
+        if getattr(exc, "contextos_resources", {}).get("phase") == "grading":
+            raise  # the saved candidate owns all LLM work; a verifier retry must not charge it again
         # The collector persists this for retries/skips, rather than treating
         # failed infrastructure attempts as free or as verified repair failures.
         timing["episode_seconds"] = time.perf_counter() - started
@@ -158,6 +181,7 @@ def run_episode(
             "events": runtime.events,
             "summary_jobs": runtime.summary_jobs,
             "interactions": runtime.t,
+            "choice_points": sum(sum(t["mask"]) > 1 for t in transitions),
             "started_at": started_at,
             "ended_at": time.time(),
         }
@@ -177,7 +201,11 @@ def finalize(
     termination: str,
     patch: str,
 ) -> dict:
-    """Attribute every dollar to the decision that caused it, then score each transition."""
+    return score_candidate(cfg, snapshot(task, transitions, costs, runtime, termination, patch), verdict)
+
+
+def snapshot(task, transitions, costs, runtime, termination, patch) -> dict:
+    """Attribute settled resource facts, without inventing a repair verdict or a learning reward."""
     resources = runtime.provider.resources() if isinstance(runtime.provider, EpisodeProvider) else {}
     waste = [0.0] * len(transitions)
     if resources:
@@ -192,15 +220,44 @@ def finalize(
             costs[source] += cost
             if outcome == "unused":
                 waste[source] += cost
-    r = cfg.reward
     for i, t in enumerate(transitions):
         terminal = i == len(transitions) - 1
         facts: dict[str, Any] = {
             "cost_usd": costs[i],
             "forced": runtime.forced.get(i, 0),
             "waste_usd": waste[i],
-            "resolved": verdict.resolved if terminal else None,
+            "resolved": None,
         }
+        for key in ("reward", "base_reward", "shaping"):
+            t.pop(key, None)
+        t.update(facts=facts, terminal=terminal)
+    return {
+        "task_id": task.instance_id,
+        "termination": termination,
+        "resolved": None,
+        "grade": None,
+        "interactions": runtime.t,
+        "cost_usd": sum(costs),
+        "forced": sum(runtime.forced.values()),
+        "return": None,
+        "base_return": None,
+        "choice_points": sum(sum(t["mask"]) > 1 for t in transitions),
+        "events": runtime.events,
+        "summary_jobs": runtime.summary_jobs,
+        "transitions": transitions,
+        "patch": patch,
+        **resources,
+    }
+
+
+def score_candidate(cfg: Config, episode: dict, verdict: Grade) -> dict:
+    """Only a genuine boolean verifier verdict can turn a saved candidate into training data."""
+    if type(verdict.resolved) is not bool:
+        raise ValueError("Verifier outcome is unknown; candidate remains unverified")
+    r = cfg.reward
+    for t in episode["transitions"]:
+        terminal, facts = t["terminal"], t["facts"]
+        facts["resolved"] = verdict.resolved if terminal else None
         base = (
             (r.success if terminal and verdict.resolved else 0.0)
             - r.cost * facts["cost_usd"]
@@ -213,20 +270,74 @@ def finalize(
         next_phi = 0.0 if terminal else -r.potential * min(2.0, max(0.0, t["next_observation"][0]))
         shaping = cfg.learner.gamma * next_phi - phi
         t.update(facts=facts, terminal=terminal, base_reward=base, shaping=shaping, reward=base + shaping)
-    return {
-        "task_id": task.instance_id,
-        "termination": termination,
-        "resolved": verdict.resolved,
-        "grade": asdict(verdict),
-        "interactions": runtime.t,
-        "cost_usd": sum(costs),
-        "forced": sum(runtime.forced.values()),
-        "return": sum(t["reward"] for t in transitions),
-        "base_return": sum(t["base_reward"] for t in transitions),
-        "choice_points": sum(sum(t["mask"]) > 1 for t in transitions),
-        "events": runtime.events,
-        "summary_jobs": runtime.summary_jobs,
-        "transitions": transitions,
-        "patch": patch,
-        **resources,
-    }
+    episode.update(
+        resolved=verdict.resolved,
+        grade=asdict(verdict),
+        **{"return": sum(t["reward"] for t in episode["transitions"])},
+        base_return=sum(t["base_reward"] for t in episode["transitions"]),
+    )
+    return episode
+
+
+def write_candidate(path: Path, record: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        with temporary.open("wb") as stream:
+            stream.write(gzip.compress(json.dumps(record).encode("utf-8")))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        exc.contextos_persistence_error = True  # type: ignore[attr-defined]
+        raise  # storage failures must pause the run, not trigger another paid agent episode
+
+
+def grade_candidate(cfg: Config, path: Path, identity: dict | None, grade: Callable[[str], Grade]) -> dict:
+    """Retry only the verifier, including after process restart; agent evidence is immutable."""
+    with gzip.open(path, "rt") as stream:
+        record = json.load(stream)
+    if record.get("schema") != 1 or record.get("identity") != identity:
+        raise ValueError(f"Candidate identity mismatch: {path}")
+    episode = record["episode"]
+    if record["state"] == "verified":
+        if type(episode.get("resolved")) is not bool:
+            raise ValueError("Verified candidate has no boolean outcome")
+        return episode
+    if record["state"] != "awaiting_grade":
+        raise ValueError("Unknown candidate state")
+    started = time.perf_counter()
+    verdict, error, failed_resources = None, None, None
+    try:
+        verdict = grade(episode["patch"])
+        if type(verdict.resolved) is not bool:
+            raise ValueError("Verifier outcome is unknown; candidate remains unverified")
+    except BaseException as exc:
+        error = f"{type(exc).__name__}: {exc}"[:500]
+        failed_resources = {
+            "phase": "grading", "candidate_file": str(path), "cost_usd": 0.0,
+            "reference_cost_usd": 0.0, "requests": [], "choice_points": 0,
+        }
+        exc.contextos_resources = failed_resources  # type: ignore[attr-defined]
+        raise
+    finally:
+        seconds = time.perf_counter() - started
+        if failed_resources is not None:
+            failed_resources["timing"] = {"grading_seconds": seconds}
+        timing = episode["timing"]
+        timing["grading_seconds"] = (timing.get("grading_seconds") or 0.0) + seconds
+        timing["episode_seconds"] += seconds
+        episode["ended_at"] = time.time()
+        episode.setdefault("grading_attempts", []).append({
+            "seconds": seconds, "error": error, "ended_at": episode["ended_at"],
+        })
+        if error is None and verdict is not None:
+            score_candidate(cfg, episode, verdict)
+            record["state"] = "verified"
+        write_candidate(path, record)
+    return episode
